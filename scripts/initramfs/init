@@ -4,6 +4,24 @@
 # by klibc dash.  Make it consistent.
 export PATH=/sbin:/usr/sbin:/bin:/usr/bin
 
+# Provide emergency shell
+#
+# On failure, provide a shell for debugging. In the case of unattended
+# deployments, Automatically reboot after a while if there is no other
+# intervention.
+emergencysh() {
+  ( sleep 30 ; reboot -f ) &
+  exec sh
+  exit 1
+}
+
+# Failure is not an option
+#
+# The expected outcome is that this script will exec the actual init(8)
+# so any exit constitutes failure.
+trap 'emergencysh' 0
+set -e
+
 [ -d /proc ] || mkdir /proc
 mount -t proc none /proc
 [ -d /sys ] || mkdir /sys
@@ -59,20 +77,43 @@ modprobe nls_cp437
 
 CMDLINE="$(cat /proc/cmdline)"
 
+find_disk() {
+  i=0
+  while :
+    do
+      if "$@" ; then
+        break
+      fi
+      if [ "$i" -eq 30 ]; then
+        echo "No partition with $1 has been found"
+        exit 1
+      fi
+      echo "$1 not detected, retrying mdev"
+      sleep 1
+      i=$((i + 1))
+      mdev -s
+    done >&2
+}
+
 parse_disk() {
-  if [ "$(echo $1|cut -c -5)" = "UUID=" ]; then
-    # $1 is a UUID
-    echo $(findfs $1)
-  elif [ "$(echo $1|cut -c -6)" = "LABEL=" ]; then
-    # $1 is a LABEL
-    echo $(findfs $1)
-  elif [ "$(echo $1|cut -c -5)" = "/dev/" ]; then
-    # $1 is a device name
-    echo $1
-  else
-    # $1 is unrecognized.
-    echo "unknown-disk"
+  if [ -n "$1" -a "${1##UUID=*}" ]; then
+    find_disk findfs "$1"
+    findfs "$1"
+  elif [ -n "$1" -a "${1##LABEL=*}" ]; then
+    find_disk findfs "$1"
+    findfs "$1"
+  elif [ -n "$1" -a "${1##/dev/*}" ]; then
+    find_disk test -b "$1"
+    echo "$1"
   fi
+}
+
+usage() {
+  echo "$1"
+  echo "Current kernel command ${CMDLINE}"
+  echo "example: ... imgpart=/dev/sda2 imgfile=/gentoo.sqs imgdata=/dev/sda3"
+  exec sh
+  exit 1
 }
 
 
@@ -82,57 +123,51 @@ do
   value=${p#*=}
 
   case $key in
+  imgpartopt)
+    IMGPARTOPT=$value
+    ;;
   imgpart)
-    IMGPART=`parse_disk $value`
+    IMGPART=$value
     ;;
   imgfile)
     IMGFILE=$value
     ;;
+  imgdataopt)
+    IMGDATAOPT=$value
+    ;;
+  imgdata)
+    IMGDATA=$value
+    ;;
   esac
 done
 
-if [ -z "${IMGPART}" ]; then
-  echo "Specify the squash image partition after the kernel command ${CMDLINE}"
-  echo "example: kernel... imgpart=/dev/sda2 imgfile=/gentoo.sqs"
-  exec sh
-  exit 0
-fi
-
-if [ -z "${IMGFILE}" ]; then
-  echo "Specify the squash image file after the kernel command ${CMDLINE}"
-  echo "example: kernel... imgpart=/dev/sda2 imgfile=/gentoo.sqs"
-  exec sh
-  exit 0
-fi
-
 echo IMGPART=${IMGPART}
+echo IMGPARTOPT=${IMGPARTOPT}
 echo IMGFILE=${IMGFILE}
+echo IMGDATA=${IMGDATA}
+echo IMGDATAOPT=${IMGDATAOPT}
 
-# Retry mdev -s 3 times before throwing the towel
-for i in 1 2 3 4 5 6
-  do
-    if [ ! -b "${IMGPART}" ]; then
-      echo  "${IMGPART} not detected,retrying mdev in 5 seconds"
-	  sleep 0.5
-      mdev -s
-    else
-	  blkid ${IMGPART}
-      break
-    fi
-  done
+IMGPART=$(parse_disk "$IMGPART")
+IMGDATA=$(parse_disk "$IMGDATA")
 
-if [ ! -b "${IMGPART}" ]; then
-  echo "No partition with ${IMGPART} has been found"
-  exec sh
-  exit 0
-fi
+[ -n "${IMGPART}" ] ||
+  usage "Specify the squash image partition"
+
+[ -n "${IMGFILE}" ] ||
+  usage "Specify the squash image file"
+
+[ -n "${IMGDATA}" ] ||
+  echo "Specify the data partition"
+
+[ x"${IMGDATA}" != x"${IMGPART}" ] ||
+  echo "Specify different image and data partitions"
 
 # ok, parsing done
 [ -d /mnt ] || mkdir /mnt
 # Mount the partitions
 # 1) mount the partition where the squash image resides
 [ -d /mnt/imgpart ] || mkdir /mnt/imgpart
-mount -t ext4 ${IMGPART} /mnt/imgpart
+mount -t ext4 -o noatime"${IMGPARTOPT:+,$IMGPARTOPT}" "${IMGPART}" /mnt/imgpart
 
 #check for recovery image, if not found create it
 if [ ! -e "/mnt/imgpart/volumio_factory.sqsh" ]; then
@@ -146,7 +181,12 @@ fi
 echo "Check for USB updates"
 if [ -e /dev/sda1 ]; then
   [ -d /mnt/usb ] || mkdir /mnt/usb
-  mount -t auto /dev/sda1 /mnt/usb
+  grep '^/dev/sda1 ' /proc/mounts |
+    if read DEV DIR OTHER ; then
+      mount --bind "$DIR" /mnt/usb
+    else
+      mount -t auto /dev/sda1 /mnt/usb
+    fi
   #If there is a firmware file inside the usb
   if [ -e /mnt/usb/volumio.fir ]; then
 	echo "Firmware found, updating will take a few minutes, please wait..."
@@ -161,14 +201,14 @@ if [ -e /dev/sda1 ]; then
     umount /mnt/factory
     rm -r /mnt/factory
   fi
-  umount /dev/sda1
+  umount /mnt/usb
   rm -r /mnt/usb
 fi
 
 
 # 2) init a loop pointing to the image file
 [ -e /dev/loop0 ] || mknod /dev/loop0 b 7 0
-losetup /dev/loop0 /mnt/imgpart/${IMGFILE}
+losetup /dev/loop0 "/mnt/imgpart/${IMGFILE}"
 
 
 # 3) mount the squashfs to /mnt/static
@@ -216,7 +256,7 @@ rm -r /boot
 # 4) mount a filesystem for write access to the static image
 # unclear: memory size? -o size=1024M
 [ -d /mnt/ext ] || mkdir -m 777 /mnt/ext
-mount -t ext4 -o noatime /dev/mmcblk0p3 /mnt/ext
+mount -t ext4 -o noatime"${IMGDATAOPT:+,$IMGDATAOPT}" "${IMGDATA}" /mnt/ext
 
 [ -d /mnt/ext/dyn ] || mkdir -m 777 /mnt/ext/dyn
 [ -d /mnt/ext/union ] || mkdir -m 777 /mnt/ext/union
@@ -225,7 +265,7 @@ mount -t ext4 -o noatime /dev/mmcblk0p3 /mnt/ext
 if [ $OVERLAY == WITHWRKDIR ]; then
   [ -d /mnt/ext/work ] || mkdir -m 777 /mnt/ext/work
   echo "With Option:" $OVERLAY
-  mount -t overlay -olowerdir=/mnt/static,upperdir=/mnt/ext/dyn,workdir=/mnt/ext/work overlay /mnt/ext/union 
+  mount -t overlay -olowerdir=/mnt/static,upperdir=/mnt/ext/dyn,workdir=/mnt/ext/work overlay /mnt/ext/union
 else
   echo "Without Option:" $OVERLAY
   mount -t overlayfs overlayfs /mnt/ext/union -olowerdir=/mnt/static,upperdir=/mnt/ext/dyn
@@ -236,8 +276,6 @@ fi
 mount --move /mnt/static /mnt/ext/union/static
 mount --move /mnt/imgpart /mnt/ext/union/imgpart
 
-chmod -R 777 /mnt/ext/union/imgpart
-
 umount /proc
 umount /sys
 
@@ -246,6 +284,4 @@ echo "Finish initramfs, continue booting Volumio"
 exec switch_root /mnt/ext/union /sbin/init
 
 echo "Failed to switch_root, dropping to a shell"
-exec sh
-
-
+exit 1
