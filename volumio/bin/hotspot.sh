@@ -33,7 +33,13 @@ interface() {
 }
 
 set -- "$1" "$(hostapd "$1")"
-set -- "$1" "/usr/sbin/hostapd$2" "/etc/hostapd/hostapd$2.conf"
+
+{
+  say "ctrl_interface=/var/run/hostapd"
+  cat "/etc/hostapd/hostapd$2.conf"
+} > /var/run/hostapd.conf
+
+set -- "$1" "/usr/sbin/hostapd$2" /var/run/hostapd.conf
 set -- "$1" "$(interface < "$3")" "$2" "$3"
 
 [ x"$1" = x"$2" ] ||
@@ -41,5 +47,6 @@ set -- "$1" "$(interface < "$3")" "$2" "$3"
 
 rm -rf /var/run/hostapd
 
-set -- "$3" -g "/var/run/hostapd/$1" "$4"
+set -- "$3" "$4"
+
 exec "$@"
